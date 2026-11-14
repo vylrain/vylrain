@@ -1,13 +1,14 @@
-collections import defaultdict, deque
+import asyncio
+import logging
+import os
+import urllib.parse
+import sqlite3
+from collections import defaultdict, deque
 from contextlib import suppress, closing
 from datetime import datetime, timezone
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, ConversationHandler
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 from openai import AsyncOpenAI
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -43,7 +44,6 @@ SYSTEM_PROMPT = (
 _history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 _locks = defaultdict(asyncio.Lock)
 
-# ---------- БД ----------
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as c:
         c.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -85,7 +85,6 @@ def set_ban(uid, reason=None):
             c.execute("UPDATE users SET is_banned=0, ban_reason=NULL WHERE uid=?", (uid,))
         c.commit()
 
-# ---------- Утилиты ----------
 def _split(text):
     out, buf = [], text
     while len(buf) > MAX_TG_LEN:
@@ -128,12 +127,19 @@ async def send_log(ctx: ContextTypes.DEFAULT_TYPE, text: str, kb=None):
     except Exception as e:
         log.warning(f"Не смог отправить в лог: {e}")
 
-# ---------- ФУНКЦИЯ ОТМЕНЫ (нужна для ConversationHandler) ----------
-async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Действие отменено.")
-    return ConversationHandler.END
+async def post_init(app: Application) -> None:
+    user_cmds = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("draw", "Сгенерировать картинку"),
+        BotCommand("reset", "Очистить память")
+    ]
+    await app.bot.set_my_commands(user_cmds)
+    admin_cmds = user_cmds + [BotCommand("admin", "Админ-панель")]
+    try:
+        await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception as e:
+        log.warning(f"Не смог установить админ-меню: {e}")
 
-# ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     log_user(u.id, u.username, u.first_name)
@@ -143,7 +149,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _history[u.id].clear()
     await update.message.reply_text(
-        "*VylaDigital на связи.*\nПиши вопрос, кидай фото, или /draw <запрос>.\n/reset — сброс.",
+        "*VylaDigital на связи.*\nПиши вопрос, кидай фото, или /draw.\n/reset — сброс.",
         parse_mode=ParseMode.MARKDOWN)
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -249,20 +255,22 @@ async def draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         final_prompt = user_prompt
 
-    url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(final_prompt)}?width=1024&height=1024&nologo=true&model=flux"
+    encoded = urllib.parse.quote(final_prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&safe=false"
     
     try:
         import httpx
         async with httpx.AsyncClient(timeout=90.0) as http:
             r = await http.get(url)
             r.raise_for_status()
+            if len(r.content) < 1000:
+                raise Exception("Сервер вернул пустую картинку")
             await update.message.reply_photo(photo=r.content, caption=f"🎨 {user_prompt}")
         await ph.delete()
     except Exception as e:
         log.exception("Draw error")
-        await ph.edit_text("Ошибка генерации. Попробуй еще раз.")
+        await ph.edit_text(f"Ошибка генерации: {type(e).__name__}. Сервер не отвечает.")
 
-# ---------- АДМИНКА ----------
 async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
@@ -329,7 +337,7 @@ async def receive_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text:
         try:
             await ctx.bot.send_message(uid, update.message.text)
-            await update.message.reply_text("✅ Текст отправлен от лица бота.")
+            await update.message.reply_text("✅ Текст отправлен.")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
     
@@ -338,7 +346,7 @@ async def receive_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         caption = update.message.caption or ""
         try:
             await ctx.bot.send_photo(uid, photo=file_id, caption=caption)
-            await update.message.reply_text("✅ Фото отправлено от лица бота.")
+            await update.message.reply_text("✅ Фото отправлено.")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
             
@@ -351,12 +359,19 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         banned = c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
     await update.message.reply_text(
         f"⚙️ *Админ-панель*\n\nВсего юзеров: {users}\nВ бане: {banned}\n\n"
-        "Для ответа используй кнопку [💬 Ответить] в логах.",
+        "Кнопки управления появляются под каждым сообщением в логах.",
         parse_mode=ParseMode.MARKDOWN)
+
+async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Действие отменено.")
+    return ConversationHandler.END
 
 def main():
     init_db()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (Application.builder()
+           .token(TELEGRAM_TOKEN)
+           .post_init(post_init)
+           .build())
     
     admin_conv = ConversationHandler(
         entry_points=[
