@@ -1,4 +1,4 @@
-# vyla_bot.py — VylaDigital (Fix Crash)
+vyla_bot.py — VylaDigital (Fix Crash)
 import asyncio, logging, os, urllib.parse, sqlite3
 from collections import defaultdict, deque
 from contextlib import suppress, closing
