@@ -1,4 +1,4 @@
-# vyla_bot.py — VylaDigital: ИИ, Vision, Draw, Админка с защитой
+# vyla_bot.py — VylaDigital: ИИ, Фото, Draw, Админка (полный код)
 import asyncio, logging, os, urllib.parse, sqlite3
 from collections import defaultdict, deque
 from contextlib import suppress, closing
@@ -16,7 +16,9 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 log = logging.getLogger("vyladigital")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+# Твой ID вписан жестко. Если в Railway есть переменная, она перезапишет, но защита не сломается.
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "8582945012"))
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
 DB_PATH = "vyla.db"
 
 client = AsyncOpenAI(
@@ -121,6 +123,14 @@ async def ask_llm(update: Update, messages):
     for p in parts[1:]: await update.message.reply_text(p)
     return buf
 
+async def send_log(ctx: ContextTypes.DEFAULT_TYPE, text: str, kb=None):
+    target = LOG_CHANNEL_ID if LOG_CHANNEL_ID else ADMIN_ID
+    if not target: return
+    try:
+        await ctx.bot.send_message(target, text, reply_markup=kb)
+    except Exception as e:
+        log.warning(f"Не смог отправить в лог-канал: {e}")
+
 # ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -150,15 +160,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     log_msg(u.id, "user", text)
 
-    if ADMIN_ID and u.id != ADMIN_ID:
+    if u.id != ADMIN_ID:
         tag = f"@{u.username}" if u.username else u.first_name
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{u.id}"),
             InlineKeyboardButton("📜 История", callback_data=f"hist_{u.id}")
         ]])
-        try:
-            await ctx.bot.send_message(ADMIN_ID, f"👤 {tag} (ID: {u.id}):\n\n{text}", reply_markup=kb)
-        except Exception: pass
+        await send_log(ctx, f"👤 {tag} (ID: {u.id}):\n\n{text}", kb=kb)
 
     async with _locks[u.id]:
         hist = _history[u.id]
@@ -182,10 +190,8 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_file = await ctx.bot.get_file(file_id)
     caption = update.message.caption or "Что на этом фото? Опиши подробно."
     
-    if ADMIN_ID and u.id != ADMIN_ID:
-        try:
-            await ctx.bot.send_message(ADMIN_ID, f"👤 @{u.username} [ФОТО] {caption}")
-        except Exception: pass
+    if u.id != ADMIN_ID:
+        await send_log(ctx, f"👤 @{u.username} [ФОТО] {caption}")
 
     await update.message.chat.send_action(ChatAction.TYPING)
     ph = await update.message.reply_text("Смотрю фото…")
@@ -204,7 +210,6 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("Vision error")
         await ph.edit_text(f"Не смог посмотреть фото: {type(e).__name__}")
 
-# ---------- ГЕНЕРАЦИЯ КАРТИНОК ----------
 async def draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     log_user(u.id, u.username, u.first_name)
@@ -217,10 +222,8 @@ async def draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user_prompt:
         await update.message.reply_text("Напиши: /draw кот в космосе"); return
         
-    if ADMIN_ID and u.id != ADMIN_ID:
-        try:
-            await ctx.bot.send_message(ADMIN_ID, f"👤 @{u.username} просит нарисовать:\n{user_prompt}")
-        except Exception: pass
+    if u.id != ADMIN_ID:
+        await send_log(ctx, f"👤 @{u.username} просит нарисовать:\n{user_prompt}")
 
     await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
     ph = await update.message.reply_text("Готовлю промт и рисую…")
@@ -251,10 +254,10 @@ async def draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("Draw error")
         await ph.edit_text("Ошибка генерации картинки. Попробуй еще раз.")
 
-# ---------- АДМИНКА (СТРОГО) ----------
+# ---------- АДМИНКА ----------
 async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # ЗАЩИТА: если нажал не админ, выходим
+    # СТРОГАЯ ПРОВЕРКА (только для твоего ID 8582945012)
     if query.from_user.id != ADMIN_ID:
         await query.answer("У вас нет прав.", show_alert=True)
         return
