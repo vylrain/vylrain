@@ -1,4 +1,4 @@
-asyncio
+import asyncio
 import logging
 import os
 import urllib.parse
@@ -70,7 +70,7 @@ client = AsyncOpenAI(
 
 SYSTEM_PROMPT = (
     "Ты VylaDigital — ИИ-ассистент, созданный vylrein.\n"
-    "Твой создатель — vylrein, школьник и энтузиаст, "
+    "Твой создатель — школьник и энтузиаст, "
     "самостоятельно занимающийся электроникой и программированием.\n"
     "Если спрашивают о создателе, отвечай: "
     "'Меня создал vylrein — школьник и энтузиаст, "
@@ -249,7 +249,7 @@ async def send_log(ctx, text, kb=None):
 async def ask_llm(update, messages):
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    placeholder = await update.message.reply_text("…")
+    placeholder = await update.message.reply_text("Думаю...")
 
     buf = ""
     last = 0.0
@@ -288,13 +288,14 @@ async def ask_llm(update, messages):
 
         with suppress(Exception):
             await placeholder.edit_text(
-                f"Ошибка ИИ: {type(e).__name__}"
+                f"Ошибка ИИ: {type(e).__name__}\n"
+                f"{str(e)[:1000]}"
             )
 
         return None
 
     if not buf.strip():
-        await placeholder.edit_text("Пустой ответ.")
+        await placeholder.edit_text("ИИ вернул пустой ответ.")
         return None
 
     parts = split_text(buf)
@@ -378,7 +379,8 @@ async def on_message(update, ctx):
     user = update.effective_user
     text = update.message.text
 
-    if not text or user.id == ADMIN_ID:
+    # Администратор тоже может общаться с ИИ
+    if not text:
         return
 
     log_user(user.id, user.username, user.first_name)
@@ -393,28 +395,31 @@ async def on_message(update, ctx):
 
     log_msg(user.id, "user", text)
 
-    tag = f"@{user.username}" if user.username else user.first_name
+    # Логируем сообщения администратора только в отдельный канал,
+    # если он настроен. Иначе не отправляем их обратно самому себе.
+    if user.id != ADMIN_ID or LOG_CHANNEL_ID:
+        tag = f"@{user.username}" if user.username else user.first_name
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🔨 Забанить",
-            callback_data=f"ban_{user.id}",
-        ),
-        InlineKeyboardButton(
-            "📜 История",
-            callback_data=f"hist_{user.id}",
-        ),
-        InlineKeyboardButton(
-            "💬 Ответить",
-            callback_data=f"reply_{user.id}",
-        ),
-    ]])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔨 Забанить",
+                callback_data=f"ban_{user.id}",
+            ),
+            InlineKeyboardButton(
+                "📜 История",
+                callback_data=f"hist_{user.id}",
+            ),
+            InlineKeyboardButton(
+                "💬 Ответить",
+                callback_data=f"reply_{user.id}",
+            ),
+        ]])
 
-    await send_log(
-        ctx,
-        f"👤 {tag} (ID: {user.id}):\n\n{text}",
-        keyboard,
-    )
+        await send_log(
+            ctx,
+            f"👤 {tag} (ID: {user.id}):\n\n{text}",
+            keyboard,
+        )
 
     async with _locks[user.id]:
         history = _history[user.id]
@@ -441,9 +446,7 @@ async def on_message(update, ctx):
 async def on_photo(update, ctx):
     user = update.effective_user
 
-    if user.id == ADMIN_ID:
-        return
-
+    # Администратор тоже может отправлять фотографии
     log_user(user.id, user.username, user.first_name)
 
     if is_banned(user.id):
@@ -453,26 +456,27 @@ async def on_photo(update, ctx):
     file_id = update.message.photo[-1].file_id
     caption = update.message.caption or "Что на этом фото? Опиши подробно."
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🔨 Забанить",
-            callback_data=f"ban_{user.id}",
-        ),
-        InlineKeyboardButton(
-            "💬 Ответить",
-            callback_data=f"reply_{user.id}",
-        ),
-    ]])
+    if user.id != ADMIN_ID or LOG_CHANNEL_ID:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔨 Забанить",
+                callback_data=f"ban_{user.id}",
+            ),
+            InlineKeyboardButton(
+                "💬 Ответить",
+                callback_data=f"reply_{user.id}",
+            ),
+        ]])
 
-    tag = f"@{user.username}" if user.username else user.first_name
+        tag = f"@{user.username}" if user.username else user.first_name
 
-    await send_log(
-        ctx,
-        f"👤 {tag} [ФОТО]\n{caption}",
-        keyboard,
-    )
+        await send_log(
+            ctx,
+            f"👤 {tag} [ФОТО]\n{caption}",
+            keyboard,
+        )
 
-    placeholder = await update.message.reply_text("Смотрю фото…")
+    placeholder = await update.message.reply_text("Смотрю фото...")
 
     try:
         tg_file = await ctx.bot.get_file(file_id)
@@ -494,7 +498,10 @@ async def on_photo(update, ctx):
             temperature=0.5,
         )
 
-        answer = response.choices[0].message.content or "Не удалось распознать фото."
+        answer = (
+            response.choices[0].message.content
+            or "Не удалось распознать фото."
+        )
 
         parts = split_text(answer)
 
@@ -508,7 +515,8 @@ async def on_photo(update, ctx):
         log.exception("Vision error")
 
         await placeholder.edit_text(
-            f"Ошибка распознавания: {type(e).__name__}"
+            f"Ошибка распознавания: {type(e).__name__}\n"
+            f"{str(e)[:1000]}"
         )
 
 
@@ -540,16 +548,17 @@ async def draw(update, ctx):
         )
     ]])
 
-    await send_log(
-        ctx,
-        f"👤 @{user.username or user.first_name} просит нарисовать:\n{user_prompt}",
-        keyboard,
-    )
+    if user.id != ADMIN_ID or LOG_CHANNEL_ID:
+        await send_log(
+            ctx,
+            f"👤 @{user.username or user.first_name} просит нарисовать:\n{user_prompt}",
+            keyboard,
+        )
 
     await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
 
     placeholder = await update.message.reply_text(
-        "Готовлю промт и рисую…"
+        "Готовлю промт и рисую..."
     )
 
     try:
@@ -605,7 +614,7 @@ async def draw(update, ctx):
 
         await placeholder.edit_text(
             f"Ошибка генерации: {type(e).__name__}. "
-            "Сервер не отвечает."
+            f"{str(e)[:500]}"
         )
 
 
@@ -654,7 +663,7 @@ async def admin_callback(update, ctx):
         set_ban(uid)
 
         await query.message.reply_text(
-            f"✅ Пользователь {uid} разблокирован."
+            f"Пользователь {uid} разблокирован."
         )
 
     elif data.startswith("hist_"):
@@ -707,7 +716,6 @@ async def receive_reason(update, ctx):
         return ConversationHandler.END
 
     set_ban(uid, text)
-
     _history[uid].clear()
 
     await update.message.reply_text(
@@ -717,7 +725,7 @@ async def receive_reason(update, ctx):
     try:
         await ctx.bot.send_message(
             uid,
-            f"⛔ Ваш аккаунт заблокирован.\nПричина: {text}",
+            f"Ваш аккаунт заблокирован.\nПричина: {text}",
         )
     except Exception:
         log.warning("Не удалось уведомить пользователя %s", uid)
@@ -764,11 +772,11 @@ async def receive_reply(update, ctx):
             )
             return WAIT_REPLY
 
-        await update.message.reply_text("✅ Отправлено.")
+        await update.message.reply_text("Отправлено.")
 
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Ошибка отправки: {type(e).__name__}"
+            f"Ошибка отправки: {type(e).__name__}"
         )
 
     return ConversationHandler.END
@@ -792,7 +800,7 @@ async def admin_panel(update, ctx):
         ).fetchone()[0]
 
     await update.message.reply_text(
-        f"⚙️ Админ-панель\n\n"
+        f"Админ-панель\n\n"
         f"Всего пользователей: {users}\n"
         f"Заблокировано: {banned}\n\n"
         "Управление доступно через кнопки в логах.\n"
@@ -823,7 +831,7 @@ async def unban_command(update, ctx):
     set_ban(uid)
 
     await update.message.reply_text(
-        f"✅ Пользователь {uid} разблокирован."
+        f"Пользователь {uid} разблокирован."
     )
 
     try:
