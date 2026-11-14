@@ -1,4 +1,4 @@
-# vyla_bot.py — VylaDigital: ИИ, Фото, Draw, Админка (полный код)
+vyla_bot.py — VylaDigital: ИИ, Фото, Draw, Админка (полный код)
 import asyncio, logging, os, urllib.parse, sqlite3
 from collections import defaultdict, deque
 from contextlib import suppress, closing
