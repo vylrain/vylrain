@@ -1,4 +1,4 @@
-# vyla_bot.py — VylaDigital. Python 3.11, python-telegram-bot 21.6, openai 1.54.0
+vyla_bot.py — VylaDigital. Python 3.11, python-telegram-bot 21.6, openai 1.54.0
 import asyncio, logging, os
 from collections import defaultdict, deque
 from contextlib import suppress
@@ -50,10 +50,7 @@ def _split(text):
     while len(buf) > MAX_TG_LEN:
         cut = buf.rfind("\n", 0, MAX_TG_LEN)
         if cut < MAX_TG_LEN // 2: cut = buf.rfind(" ", 0, MAX_TG_LEN)
-        if cut <= 0: cut = MAX_TG_LEN
-        out.append(buf[:cut]); buf = buf[cut:].lstrip()
-    if buf: out.append(buf)
-    return out
+        if cut <= 0: 
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid, text = update.effective_user.id, update.message.text
