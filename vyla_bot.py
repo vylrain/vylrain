@@ -1,4 +1,4 @@
-vyla_bot.py — VylaDigital: ИИ, Фото, Draw, Админка (полный код)
+# vyla_bot.py — VylaDigital (Fix Crash)
 import asyncio, logging, os, urllib.parse, sqlite3
 from collections import defaultdict, deque
 from contextlib import suppress, closing
@@ -16,7 +16,6 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 log = logging.getLogger("vyladigital")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-# Твой ID вписан жестко. Если в Railway есть переменная, она перезапишет, но защита не сломается.
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8582945012"))
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
 DB_PATH = "vyla.db"
@@ -129,7 +128,12 @@ async def send_log(ctx: ContextTypes.DEFAULT_TYPE, text: str, kb=None):
     try:
         await ctx.bot.send_message(target, text, reply_markup=kb)
     except Exception as e:
-        log.warning(f"Не смог отправить в лог-канал: {e}")
+        log.warning(f"Не смог отправить в лог: {e}")
+
+# ---------- ФУНКЦИЯ ОТМЕНЫ (нужна для ConversationHandler) ----------
+async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Действие отменено.")
+    return ConversationHandler.END
 
 # ---------- ХЕНДЛЕРЫ ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -151,7 +155,8 @@ async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u, text = update.effective_user, update.message.text
     if not text: return
-    
+    if u.id == ADMIN_ID: return
+
     log_user(u.id, u.username, u.first_name)
     user = get_user(u.id)
     if user and user[7] == 1:
@@ -160,13 +165,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     log_msg(u.id, "user", text)
 
-    if u.id != ADMIN_ID:
-        tag = f"@{u.username}" if u.username else u.first_name
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{u.id}"),
-            InlineKeyboardButton("📜 История", callback_data=f"hist_{u.id}")
-        ]])
-        await send_log(ctx, f"👤 {tag} (ID: {u.id}):\n\n{text}", kb=kb)
+    tag = f"@{u.username}" if u.username else u.first_name
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{u.id}"),
+        InlineKeyboardButton("📜 История", callback_data=f"hist_{u.id}"),
+        InlineKeyboardButton("💬 Ответить", callback_data=f"reply_{u.id}")
+    ]])
+    await send_log(ctx, f"👤 {tag} (ID: {u.id}):\n\n{text}", kb=kb)
 
     async with _locks[u.id]:
         hist = _history[u.id]
@@ -180,18 +185,23 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    if u.id == ADMIN_ID: return 
+    
     log_user(u.id, u.username, u.first_name)
     user = get_user(u.id)
     if user and user[7] == 1:
-        await update.message.reply_text(f"Вы забанены. Причина: {user[8]}")
+        await update.message.reply_text(f"Вы забанены.")
         return
         
     file_id = update.message.photo[-1].file_id
     tg_file = await ctx.bot.get_file(file_id)
     caption = update.message.caption or "Что на этом фото? Опиши подробно."
     
-    if u.id != ADMIN_ID:
-        await send_log(ctx, f"👤 @{u.username} [ФОТО] {caption}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{u.id}"),
+        InlineKeyboardButton("💬 Ответить", callback_data=f"reply_{u.id}")
+    ]])
+    await send_log(ctx, f"👤 @{u.username} [ФОТО] {caption}", kb=kb)
 
     await update.message.chat.send_action(ChatAction.TYPING)
     ph = await update.message.reply_text("Смотрю фото…")
@@ -214,16 +224,16 @@ async def draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     log_user(u.id, u.username, u.first_name)
     user = get_user(u.id)
-    if user and user[7] == 1:
-        await update.message.reply_text(f"Вы забанены.")
-        return
+    if user and user[7] == 1: return
         
     user_prompt = " ".join(ctx.args).strip()
     if not user_prompt:
         await update.message.reply_text("Напиши: /draw кот в космосе"); return
         
-    if u.id != ADMIN_ID:
-        await send_log(ctx, f"👤 @{u.username} просит нарисовать:\n{user_prompt}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 Ответить", callback_data=f"reply_{u.id}")
+    ]])
+    await send_log(ctx, f"👤 @{u.username} просит нарисовать:\n{user_prompt}", kb=kb)
 
     await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
     ph = await update.message.reply_text("Готовлю промт и рисую…")
@@ -252,12 +262,11 @@ async def draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ph.delete()
     except Exception as e:
         log.exception("Draw error")
-        await ph.edit_text("Ошибка генерации картинки. Попробуй еще раз.")
+        await ph.edit_text("Ошибка генерации. Попробуй еще раз.")
 
 # ---------- АДМИНКА ----------
 async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # СТРОГАЯ ПРОВЕРКА (только для твоего ID 8582945012)
     if query.from_user.id != ADMIN_ID:
         await query.answer("У вас нет прав.", show_alert=True)
         return
@@ -267,14 +276,14 @@ async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ban_"):
         uid = int(data.split("_")[1])
         ctx.user_data["ban_target"] = uid
-        await query.message.reply_text(f"Введите причину бана для ID {uid}:\n(или отправьте 'отмена')")
+        await query.message.reply_text(f"Введите причину бана для ID {uid}:\n(или 'отмена')")
         return "WAIT_REASON"
         
     elif data.startswith("unban_"):
         uid = int(data.split("_")[1])
         set_ban(uid)
         await query.answer("Разбанен.")
-        await query.message.edit_text(query.message.text + "\n\n✅ Пользователь разбанен.")
+        await query.message.edit_text(query.message.text + "\n\n✅ Разбанен.")
         
     elif data.startswith("hist_"):
         uid = int(data.split("_")[1])
@@ -285,25 +294,56 @@ async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         text = "\n\n".join(f"[{ts}] {role.upper()}: {t[:150]}" for role, t, ts in reversed(rows))
         await ctx.bot.send_message(ADMIN_ID, f"История ID {uid}:\n\n{text}")
+        
+    elif data.startswith("reply_"):
+        uid = int(data.split("_")[1])
+        ctx.user_data["reply_target"] = uid
+        await query.message.reply_text(f"Напиши текст или отправь фото, которое бот отправит юзеру (ID {uid}):\n(или 'отмена')")
+        return "WAIT_REPLY"
 
 async def receive_reason(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
     if update.message.text.lower() == "отмена":
-        await update.message.reply_text("Бан отменен.")
-        return ConversationHandler.END
+        await update.message.reply_text("Отменено."); return ConversationHandler.END
         
     reason = update.message.text
     uid = ctx.user_data.get("ban_target")
     if not uid: return ConversationHandler.END
     
     set_ban(uid, reason)
-    await update.message.reply_text(f"ID {uid} забанен. Причина: {reason}")
-    
+    await update.message.reply_text(f"ID {uid} забанен.")
     try:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔓 Разбанить", callback_data=f"unban_{uid}")]])
         await ctx.bot.send_message(uid, f"⛔ Ваш аккаунт заблокирован.\nПричина: {reason}", reply_markup=kb)
     except Exception: pass
+    return ConversationHandler.END
+
+async def receive_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    
+    uid = ctx.user_data.get("reply_target")
+    if not uid: return ConversationHandler.END
+
+    if update.message.text and update.message.text.lower() == "отмена":
+        await update.message.reply_text("Отменено.")
+        return ConversationHandler.END
+
+    if update.message.text:
+        try:
+            await ctx.bot.send_message(uid, update.message.text)
+            await update.message.reply_text("✅ Текст отправлен от лица бота.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+    
+    elif update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        caption = update.message.caption or ""
+        try:
+            await ctx.bot.send_photo(uid, photo=file_id, caption=caption)
+            await update.message.reply_text("✅ Фото отправлено от лица бота.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+            
     return ConversationHandler.END
 
 async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -313,24 +353,33 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         banned = c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
     await update.message.reply_text(
         f"⚙️ *Админ-панель*\n\nВсего юзеров: {users}\nВ бане: {banned}\n\n"
-        "Каждое сообщение приходит тебе с кнопками.",
+        "Для ответа используй кнопку [💬 Ответить] в логах.",
         parse_mode=ParseMode.MARKDOWN)
 
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    ban_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_callback, pattern="^ban_")],
-        states={"WAIT_REASON": [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reason)]},
-        fallbacks=[]
+    admin_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_callback, pattern="^ban_"),
+            CallbackQueryHandler(admin_callback, pattern="^reply_")
+        ],
+        states={
+            "WAIT_REASON": [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reason)],
+            "WAIT_REPLY": [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reply),
+                MessageHandler(filters.PHOTO, receive_reply)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)]
     )
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("draw", draw))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(ban_conv)
+    app.add_handler(admin_conv)
     app.add_handler(CallbackQueryHandler(admin_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
