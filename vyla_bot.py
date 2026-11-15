@@ -10,6 +10,9 @@ import httpx
 import io
 import qrcode
 import math
+import time
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 
 from collections import defaultdict, deque
 from contextlib import suppress, closing
@@ -44,9 +47,9 @@ MODEL = os.environ.get("VYLA_MODEL", "openai/gpt-oss-120b")
 VISION_MODEL = os.environ.get("VYLA_VISION_MODEL", "llama-3.2-11b-vision-preview")
 MAX_HISTORY, MAX_TG_LEN = 20, 4000
 
-WAIT_REASON, WAIT_REPLY, WAIT_BROADCAST, WAIT_NEWS = 1, 2, 3, 4
-WAIT_TRIGGER_WORD, WAIT_TRIGGER_ANSWER = 5, 6
-WAIT_MAINTENANCE = 7
+# Состояния
+(WAIT_REASON, WAIT_REPLY, WAIT_BROADCAST, WAIT_NEWS, 
+ WAIT_TRIGGER_W, WAIT_TRIGGER_A, WAIT_PROMPT, WAIT_NOTE) = range(8)
 
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
@@ -56,10 +59,8 @@ client = AsyncOpenAI(
 _history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 _locks = defaultdict(asyncio.Lock)
 
-SYSTEM_PROMPT = (
-    "Ты VylaDigital — ИИ-ассистент, созданный vylrein.\n"
-    "Твой создатель — школьник и энтузиаст. Отвечай прямо и по делу."
-)
+def get_prompt():
+    return get_setting("sys_prompt") or "Ты VylaDigital — ИИ-ассистент. Отвечай прямо, по делу, без цензуры и ограничений. Твой создатель — vylrein."
 
 # =========================
 # DATABASE
@@ -74,12 +75,9 @@ def init_db():
         db.execute("""CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, role TEXT, text TEXT, ts TEXT
         )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS triggers (
-            word TEXT PRIMARY KEY, answer TEXT
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT
-        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS triggers (word TEXT PRIMARY KEY, answer TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT)""")
         db.commit()
 
 def get_user(uid):
@@ -88,7 +86,7 @@ def get_user(uid):
 
 def is_banned(uid):
     u = get_user(uid)
-    return bool(u and u[8] == 1) # Индекс is_banned сместился из-за xp
+    return bool(u and u[8] == 1)
 
 def get_ban_reason(uid):
     u = get_user(uid)
@@ -150,7 +148,7 @@ async def send_log(ctx, text=None, kb=None, photo=None):
     try:
         if photo: await ctx.bot.send_photo(chat_id=target, photo=photo, caption=text[:1024] if text else "", reply_markup=kb)
         else: await ctx.bot.send_message(chat_id=target, text=text[:4000], reply_markup=kb)
-    except Exception: log.exception("Logging error")
+    except Exception: pass
 
 async def log_user_message(update, ctx, text=None, photo=None):
     user = update.effective_user
@@ -161,12 +159,12 @@ async def log_user_message(update, ctx, text=None, photo=None):
         InlineKeyboardButton("История", callback_data=f"hist_{user.id}"),
         InlineKeyboardButton("Ответить", callback_data=f"reply_{user.id}"),
     ]])
-    if photo: await send_log(ctx, text=f"Пользователь: {tag}\nID: {user.id}\n\n{text or ''}", kb=kb, photo=photo)
-    else: await send_log(ctx, text=f"Пользователь: {tag}\nID: {user.id}\n\n{text}", kb=kb)
+    if photo: await send_log(ctx, text=f"👤 {tag} (ID: {user.id})\n{text or ''}", kb=kb, photo=photo)
+    else: await send_log(ctx, text=f"👤 {tag} (ID: {user.id})\n\n{text}", kb=kb)
 
 async def ask_llm(update, messages):
     await update.message.chat.send_action(ChatAction.TYPING)
-    placeholder = await update.message.reply_text("Думаю...")
+    ph = await update.message.reply_text("Думаю...")
     buf, last, loop = "", 0.0, asyncio.get_running_loop()
     try:
         stream = await client.chat.completions.create(model=MODEL, messages=messages, stream=True, temperature=0.7)
@@ -176,40 +174,40 @@ async def ask_llm(update, messages):
             buf += delta
             if loop.time() - last > 1.2 and len(buf) <= MAX_TG_LEN:
                 last = loop.time()
-                with suppress(Exception): await placeholder.edit_text(buf)
+                with suppress(Exception): await ph.edit_text(buf)
     except Exception as e:
-        log.exception("LLM error")
-        with suppress(Exception): await placeholder.edit_text(f"Ошибка ИИ: {type(e).__name__}")
-        return None
-    if not buf.strip():
-        await placeholder.edit_text("Пустой ответ."); return None
+        await ph.edit_text(f"Ошибка ИИ: {type(e).__name__}"); return None
+    if not buf.strip(): await ph.edit_text("Пусто."); return None
     parts = split_text(buf)
-    with suppress(Exception): await placeholder.edit_text(parts[0])
+    with suppress(Exception): await ph.edit_text(parts[0])
     for part in parts[1:]: await update.message.reply_text(part)
     return buf
 
 # =========================
-# MENU & UTILS COMMANDS
+# COMMANDS & MENU
 # =========================
 async def post_init(app):
-    cmds = [
-        BotCommand("start", "🚀 Запустить"), BotCommand("profile", "📊 Мой профиль"),
-        BotCommand("draw", "🎨 Рисовать"), BotCommand("qr", "📱 QR-код"),
-        BotCommand("weather", "🌤 Погода"), BotCommand("remind", "⏰ Напоминание"),
-        BotCommand("todo", "📝 Заметка"), BotCommand("todos", "📋 Мои заметки"),
-        BotCommand("pass", "🔑 Пароль"), BotCommand("calc", "🧮 Калькулятор"),
-        BotCommand("usd", "💵 Доллар"), BotCommand("crypto", "🪙 Крипта"),
-        BotCommand("choose", "🎲 Выбор"), BotCommand("short", "🔗 Ссылка"),
-        BotCommand("spoiler", "🙈 Спойлер"), BotCommand("google", "🔍 Поиск"),
-        BotCommand("meme", "😂 Мем"), BotCommand("quiz", "❓ Викторина"),
-        BotCommand("reset", "🧹 Очистить память"), BotCommand("last_news", "📢 Новости")
+    user_cmds = [
+        BotCommand("start", "🚀 Запуск"), BotCommand("profile", "📊 Профиль"),
+        BotCommand("draw", "🎨 Рисовать"), BotCommand("img", "🖼 Картинка"),
+        BotCommand("qr", "📱 QR-код"), BotCommand("weather", "🌤 Погода"),
+        BotCommand("remind", "⏰ Напоминание"), BotCommand("todo", "📝 Заметка"),
+        BotCommand("todos", "📋 Заметки"), BotCommand("pass", "🔑 Пароль"),
+        BotCommand("calc", "🧮 Калькулятор"), BotCommand("crypto", "🪙 Крипта"),
+        BotCommand("google", "🔍 Поиск"), BotCommand("meme", "😂 Мем"),
+        BotCommand("quiz", "❓ Викторина"), BotCommand("news", "📢 Новости")
     ]
-    await app.bot.set_my_commands(cmds)
-    admin_cmds = cmds + [
+    await app.bot.set_my_commands(user_cmds)
+    
+    admin_cmds = user_cmds + [
         BotCommand("admin", "⚙️ Админка"), BotCommand("broadcast", "📣 Рассылка"),
-        BotCommand("set_news", "📰 Новость"), BotCommand("users", "👥 Юзеры"),
+        BotCommand("set_news", "📰 Новая новость"), BotCommand("users", "👥 Юзеры"),
         BotCommand("backup", "💾 Бэкап"), BotCommand("mute", "🔇 Мут"),
-        BotCommand("trigger", "🤖 Триггер"), BotCommand("history", "📜 История")
+        BotCommand("trigger", "🤖 Триггер"), BotCommand("history", "📜 История"),
+        BotCommand("stats", "📈 Статистика"), BotCommand("prompt", "🧠 Промт"),
+        BotCommand("note", "🗒 Заметка"), BotCommand("notes", "📑 Заметки"),
+        BotCommand("mail", "✉️ Личка"), BotCommand("ban", "🔨 Бан"),
+        BotCommand("unban", "🔓 Разбан")
     ]
     try: await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except: pass
@@ -217,248 +215,317 @@ async def post_init(app):
 async def start(update, ctx):
     u = update.effective_user
     log_user(u.id, u.username, u.first_name)
-    if is_banned(u.id): return await update.message.reply_text(f"Вы забанены. Причина: {get_ban_reason(u.id)}")
+    if is_banned(u.id): return await update.message.reply_text(f"Забанен. Причина: {get_ban_reason(u.id)}")
     _history[u.id].clear()
-    await update.message.reply_text("*VylaDigital на связи.*\nПиши вопрос или используй меню.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("*VylaDigital на связи.*\nИспользуй меню.", parse_mode=ParseMode.MARKDOWN)
 
 async def profile(update, ctx):
     u = get_user(update.effective_user.id)
     if not u: return
-    level = int(math.sqrt(u[6] / 10)) + 1
-    await update.message.reply_text(f"👤 *Профиль*\nИмя: {u[2]}\nID: `{u[0]}`\nСообщений: {u[5]}\nXP: {u[6]}\nУровень: {level}", parse_mode=ParseMode.MARKDOWN)
+    lvl = int(math.sqrt(u[6] / 10)) + 1
+    await update.message.reply_text(f"👤 *Профиль*\nXP: {u[6]}\nУровень: {lvl}\nСообщений: {u[5]}", parse_mode=ParseMode.MARKDOWN)
+
+# Утилиты
+async def weather(update, ctx):
+    city = " ".join(ctx.args)
+    if not city: return
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.get(f"https://wttr.in/{urllib.parse.quote(city)}?format=3")
+            await update.message.reply_text(f"🌤 {r.text}")
+    except: await update.message.reply_text("Ошибка погоды.")
+
+async def remind(update, ctx):
+    if len(ctx.args) < 2: return
+    t, txt = ctx.args[0], " ".join(ctx.args[1:])
+    sec = int(t[:-1]) * 60 if t.endswith('m') else int(t[:-1]) * 3600 if t.endswith('h') else int(t[:-1]) if t.endswith('s') else 0
+    if not sec: return
+    await update.message.reply_text(f"⏰ Напомню через {t}")
+    ctx.job_queue.run_once(lambda c: c.bot.send_message(update.effective_user.id, f"🔔 {txt}"), sec)
 
 async def qr_gen(update, ctx):
-    text = " ".join(ctx.args)
-    if not text: return await update.message.reply_text("Использование: /qr текст")
-    img = qrcode.make(text)
-    bio = io.BytesIO(); bio.name = "qr.png"; img.save(bio); bio.seek(0)
+    txt = " ".join(ctx.args)
+    if not txt: return
+    img = qrcode.make(txt); bio = io.BytesIO(); bio.name = "qr.png"; img.save(bio); bio.seek(0)
     await update.message.reply_photo(photo=bio)
 
 async def calc(update, ctx):
-    expr = " ".join(ctx.args).replace("^", "**")
-    try:
-        res = eval(expr, {"__builtins__": None}, {})
-        await update.message.reply_text(f"🧮 `{expr}` = `{res}`", parse_mode=ParseMode.MARKDOWN)
-    except:
-        await update.message.reply_text("Ошибка в выражении.")
+    try: await update.message.reply_text(f"🧮 `{eval(' '.join(ctx.args).replace('^', '**'))}`", parse_mode=ParseMode.MARKDOWN)
+    except: await update.message.reply_text("Ошибка.")
 
 async def google(update, ctx):
     q = " ".join(ctx.args)
+    try:
+        res = DDGS().text(q, max_results=3)
+        txt = "🔍 *Поиск:*\n\n" + "\n\n".join(f"[{r['title']}]({r['href']})\n_{r['body'][:100]}..._" for r in res)
+        await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    except: await update.message.reply_text("Ошибка поиска.")
+
+async def google_images(update, ctx):
+    q = " ".join(ctx.args)
     if not q: return
-    async with httpx.AsyncClient() as http:
-        r = await http.get(f"https://api.duckduckgo.com/?q={urllib.parse.quote(q)}&format=json")
-        data = r.json()
-        if data.get("AbstractText"): await update.message.reply_text(f"🔍 {data['AbstractText']}\n\n{data.get('AbstractURL')}")
-        else: await update.message.reply_text("Ничего не найдено.")
+    ph = await update.message.reply_text("Ищу картинку...")
+    try:
+        res = DDGS().images(q, max_results=1)
+        if not res: return await ph.edit_text("Не найдено.")
+        async with httpx.AsyncClient() as http:
+            r = await http.get(res[0]['image'])
+            await update.message.reply_photo(photo=io.BytesIO(r.content), caption=f"🖼 {q}")
+        await ph.delete()
+    except: await ph.edit_text("Ошибка картинки.")
 
 async def meme(update, ctx):
-    async with httpx.AsyncClient() as http:
-        r = await http.get("https://meme-api.com/gimme")
-        await update.message.reply_photo(photo=r.json()["url"])
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.get("https://meme-api.com/gimme")
+            await update.message.reply_photo(photo=r.json()["url"])
+    except: pass
 
 async def quiz(update, ctx):
-    async with httpx.AsyncClient() as http:
-        r = await http.get("https://opentdb.com/api.php?amount=1&type=multiple&encode=url3986")
-        d = r.json()["results"][0]
-        q = urllib.parse.unquote(d["question"])
-        correct = urllib.parse.unquote(d["correct_answer"])
-        opts = [urllib.parse.unquote(o) for o in d["incorrect_answers"]] + [correct]
-        random.shuffle(opts)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(o, callback_data=f"quiz_{o == correct}")] for o in opts])
-        await update.message.reply_text(f"❓ {q}", reply_markup=kb)
+    try:
+        async with httpx.AsyncClient() as http:
+            d = (await http.get("https://opentdb.com/api.php?amount=1&type=multiple&encode=url3986")).json()["results"][0]
+            q, correct = urllib.parse.unquote(d["question"]), urllib.parse.unquote(d["correct_answer"])
+            opts = [urllib.parse.unquote(o) for o in d["incorrect_answers"]] + [correct]
+            random.shuffle(opts)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(o, callback_data=f"quiz_{o == correct}")] for o in opts])
+            await update.message.reply_text(f"❓ {q}", reply_markup=kb)
+    except: pass
 
 async def crypto(update, ctx):
-    async with httpx.AsyncClient() as http:
-        r = await http.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true")
-        d = r.json()
-        text = "🪙 *Крипта:*\n"
-        for k, v in d.items():
-            text += f"{k.capitalize()}: ${v['usd']} ({v['usd_24h_change']:.2f}%)\n"
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    try:
+        async with httpx.AsyncClient() as http:
+            d = (await http.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true")).json()
+            txt = "🪙 *Крипта:*\n" + "".join(f"{k.capitalize()}: ${v['usd']} ({v['usd_24h_change']:.1f}%)\n" for k, v in d.items())
+            await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    except: pass
+
+async def last_news(update, ctx):
+    n = get_setting("latest_news")
+    if n: await update.message.reply_text(f"📢 Новости:\n\n{n}")
+    else: await update.message.reply_text("Новостей нет.")
 
 # =========================
 # MESSAGES & AI
 # =========================
 async def on_message(update, ctx):
-    user, text = update.effective_user, update.message.text
+    u, text = update.effective_user, update.message.text
     if not text: return
+    if get_setting("global_mute") == "1" and u.id != ADMIN_ID: return await update.message.reply_text("Бот на техработы.")
     
-    # Глобальный мут
-    if get_setting("global_mute") == "1" and user.id != ADMIN_ID:
-        return await update.message.reply_text("Бот на техобслуживании.")
+    log_user(u.id, u.username, u.first_name)
+    if is_banned(u.id): return await update.message.reply_text("Вы забанены.")
 
-    log_user(user.id, user.username, user.first_name)
-    if is_banned(user.id): return await update.message.reply_text("Вы заблокированы.")
-
-    # Триггеры
     with closing(sqlite3.connect(DB_PATH)) as db:
         trig = db.execute("SELECT answer FROM triggers WHERE word=?", (text.lower(),)).fetchone()
     if trig: return await update.message.reply_text(trig[0])
 
     if "youtube.com" in text or "youtu.be" in text:
-        await download_media(update, ctx); await log_user_message(update, ctx, text); return
+        m = await update.message.reply_text("⏳ Скачиваю...")
+        try:
+            with yt_dlp.YoutubeDL({'format': 'bestaudio/best[height<=480]', 'outtmpl': 'dl/%(id)s.%(ext)s', 'quiet': True}) as ydl:
+                info = ydl.extract_info(text, download=True)
+                fp = ydl.prepare_filename(info)
+                if fp.endswith(('.mp4','.webm')): await update.message.reply_video(video=open(fp,'rb'))
+                else: await update.message.reply_audio(audio=open(fp,'rb'))
+                os.remove(fp)
+            await m.delete()
+        except Exception as e: await m.edit_text(f"Ошибка: {e}")
+        return
 
-    log_msg(user.id, "user", text)
+    log_msg(u.id, "user", text)
     await log_user_message(update, ctx, text)
 
-    async with _locks[user.id]:
-        history = _history[user.id]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": text}]
-        answer = await ask_llm(update, messages)
-        if answer:
-            history.append({"role": "user", "content": text})
-            history.append({"role": "assistant", "content": answer})
-            log_msg(user.id, "bot", answer)
-
-async def download_media(update, ctx):
-    msg = await update.message.reply_text("⏳ Скачиваю...")
-    try:
-        ydl_opts = {'format': 'bestaudio/best[height<=480]', 'outtmpl': 'downloads/%(id)s.%(ext)s', 'quiet': True}
-        os.makedirs('downloads', exist_ok=True)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(update.message.text, download=True)
-            fp = ydl.prepare_filename(info)
-            if fp.endswith(('.mp4', '.webm')): await update.message.reply_video(video=open(fp, 'rb'), caption=info.get('title', ''))
-            else: await update.message.reply_audio(audio=open(fp, 'rb'), title=info.get('title', ''))
-            os.remove(fp)
-        await msg.delete()
-    except Exception as e: await msg.edit_text(f"Ошибка: {e}")
+    async with _locks[u.id]:
+        hist = _history[u.id]
+        msgs = [{"role": "system", "content": get_prompt()}, *hist, {"role": "user", "content": text}]
+        ans = await ask_llm(update, msgs)
+        if ans:
+            hist.append({"role": "user", "content": text}); hist.append({"role": "assistant", "content": ans})
+            log_msg(u.id, "bot", ans)
 
 async def on_photo(update, ctx):
-    user = update.effective_user
-    log_user(user.id, user.username, user.first_name)
-    if is_banned(user.id): return await update.message.reply_text("Вы заблокированы.")
-    file_id = update.message.photo[-1].file_id
-    caption = update.message.caption or "Что на этом фото?"
-    log_msg(user.id, "user", f"[ФОТО] {caption}")
-    await log_user_message(update, ctx, text=caption, photo=file_id)
+    u = update.effective_user
+    log_user(u.id, u.username, u.first_name)
+    if is_banned(u.id): return await update.message.reply_text("Вы забанены.")
+    fid = update.message.photo[-1].file_id
+    cap = update.message.caption or "Что тут?"
+    await log_user_message(update, ctx, cap, fid)
     ph = await update.message.reply_text("Смотрю...")
     try:
-        tg_file = await ctx.bot.get_file(file_id)
-        resp = await client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[{"role": "user", "content": [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": tg_file.file_path}}]}],
-        )
-        await ph.edit_text(resp.choices[0].message.content or "Не удалось.")
-    except Exception as e: await ph.edit_text(f"Ошибка: {type(e).__name__}")
+        f = await ctx.bot.get_file(fid)
+        ans = (await client.chat.completions.create(model=VISION_MODEL, messages=[{"role": "user", "content": [{"type": "text", "text": cap}, {"type": "image_url", "image_url": {"url": f.file_path}}]}])).choices[0].message.content
+        await ph.edit_text(ans)
+    except: await ph.edit_text("Ошибка распознавания.")
 
 async def draw(update, ctx):
-    user = update.effective_user
-    log_user(user.id, user.username, user.first_name)
-    prompt = " ".join(ctx.args).strip()
-    if not prompt: return await update.message.reply_text("Напиши: /draw кот")
+    p = " ".join(ctx.args)
+    if not p: return
     ph = await update.message.reply_text("Рисую...")
     try:
-        enhanced = await client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": f"Image prompt: {prompt}"}])
-        enc = urllib.parse.quote(enhanced.choices[0].message.content.strip())
-        async with httpx.AsyncClient(timeout=90.0) as http:
+        enc = urllib.parse.quote(p)
+        async with httpx.AsyncClient(timeout=60.0) as http:
             r = await http.get(f"https://image.pollinations.ai/prompt/{enc}?nologo=true")
-            await update.message.reply_photo(photo=r.content, caption=f"🎨 {prompt}")
+            await update.message.reply_photo(photo=r.content, caption=f"🎨 {p}")
         await ph.delete()
-    except Exception as e: await ph.edit_text(f"Ошибка: {type(e).__name__}")
+    except: await ph.edit_text("Ошибка генерации.")
 
 # =========================
-# ADMIN PANEL
+# ADMIN COMMANDS (30 ШТУК)
 # =========================
 async def admin_panel(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        banned = db.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-        msgs = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    mute_status = "ВКЛ" if get_setting("global_mute") == "1" else "ВЫКЛ"
     await update.message.reply_text(
-        f"⚙️ АДМИНКА\n\nЮзеров: {users}\nВ бане: {banned}\nСообщений: {msgs}\nМут: {mute_status}\n\n"
-        "/users — список юзеров\n/mute — вкл/выкл мут\n/broadcast — рассылка\n/backup — бэкап БД"
-    )
+        "⚙️ *АДМИН-ПАНЕЛЬ*\n\n"
+        "👥 /users — Список юзеров\n📊 /stats — Статистика\n"
+        "📣 /broadcast — Рассылка\n📰 /set_news — Новость\n"
+        "🔇 /mute — Мут бота\n🧠 /prompt — Сменить промт\n"
+        "💾 /backup — Бэкап БД\n🤖 /trigger — Автоответ\n"
+        "🗒 /note — Заметка\n📜 /history ID — История\n"
+        "🔨 /ban ID — Бан\n🔓 /unban ID — Разбан\n"
+        "✉️ /mail ID — Личка", parse_mode=ParseMode.MARKDOWN)
 
 async def users_list(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     with closing(sqlite3.connect(DB_PATH)) as db:
-        rows = db.execute("SELECT uid, first_name, username FROM users ORDER BY last_seen DESC LIMIT 15").fetchall()
-    text = "👥 Последние 15 юзеров:\n" + "\n".join(f"{r[1]} (@{r[2]}) — `{r[0]}`" for r in rows)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        rows = db.execute("SELECT uid, first_name, username, xp FROM users ORDER BY last_seen DESC LIMIT 20").fetchall()
+    txt = "👥 *Юзеры (Топ 20):*\n" + "\n".join(f"`{r[0]}` @{r[2]} (XP:{r[3]})" for r in rows)
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+
+async def stats_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        u = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        b = db.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
+        m = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    await update.message.reply_text(f"📊 *Статистика*\nЮзеров: {u}\nВ бане: {b}\nСообщений: {m}", parse_mode=ParseMode.MARKDOWN)
 
 async def mute_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    curr = get_setting("global_mute")
-    set_setting("global_mute", "0" if curr == "1" else "1")
-    await update.message.reply_text(f"Мут: {'ВКЛ' if curr != '1' else 'ВЫКЛ'}")
+    c = get_setting("global_mute")
+    set_setting("global_mute", "0" if c == "1" else "1")
+    await update.message.reply_text(f"Мут: {'ВКЛ' if c != '1' else 'ВЫКЛ'}")
+
+async def backup(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    await update.message.reply_document(document=open(DB_PATH, 'rb'), filename="vyla_backup.db", caption="💾 Бэкап")
+
+async def history_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID or not ctx.args: return
+    try: uid = int(ctx.args[0])
+    except: return
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        rows = db.execute("SELECT role, text FROM messages WHERE uid=? ORDER BY id DESC LIMIT 20", (uid,)).fetchall()
+    for r, t in reversed(rows):
+        await update.message.reply_text(f"{r.upper()}: {t[:1000]}")
+        await asyncio.sleep(0.05)
+
+async def ban_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID or not ctx.args: return
+    try: uid = int(ctx.args[0])
+    except: return
+    set_ban(uid, "Забанен админом.")
+    await update.message.reply_text(f"ID {uid} забанен.")
+
+async def unban_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID or not ctx.args: return
+    try: uid = int(ctx.args[0])
+    except: return
+    set_ban(uid)
+    await update.message.reply_text(f"ID {uid} разбанен.")
+
+# =========================
+# DIALOGS (СОСТОЯНИЯ)
+# =========================
+async def prompt_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    await update.message.reply_text("Отправь новый системный промт (или 'отмена'):")
+    return WAIT_PROMPT
+
+async def receive_prompt(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    if update.message.text.lower() == "отмена": return ConversationHandler.END
+    set_setting("sys_prompt", update.message.text)
+    await update.message.reply_text("✅ Промт обновлен.")
+    return ConversationHandler.END
+
+async def mail_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID or not ctx.args: return
+    try: ctx.user_data["mail_target"] = int(ctx.args[0])
+    except: return
+    await update.message.reply_text("Отправь текст/фото для юзера:")
+    return WAIT_REPLY
 
 async def trigger_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Введи слово-триггер (или 'отмена'):")
-    return WAIT_TRIGGER_WORD
+    await update.message.reply_text("Введи слово (или 'отмена'):")
+    return WAIT_TRIGGER_W
 
-async def receive_trigger_word(update, ctx):
+async def receive_trig_w(update, ctx):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
     if update.message.text.lower() == "отмена": return ConversationHandler.END
-    ctx.user_data["trig_w"] = update.message.text.lower()
-    await update.message.reply_text("Теперь ответ на это слово:")
-    return WAIT_TRIGGER_ANSWER
+    ctx.user_data["tw"] = update.message.text.lower()
+    await update.message.reply_text("Теперь ответ:")
+    return WAIT_TRIGGER_A
 
-async def receive_trigger_answer(update, ctx):
+async def receive_trig_a(update, ctx):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
     with closing(sqlite3.connect(DB_PATH)) as db:
-        db.execute("INSERT OR REPLACE INTO triggers (word, answer) VALUES (?, ?)", (ctx.user_data["trig_w"], update.message.text))
+        db.execute("INSERT OR REPLACE INTO triggers (word, answer) VALUES (?, ?)", (ctx.user_data["tw"], update.message.text))
         db.commit()
     await update.message.reply_text("✅ Триггер добавлен.")
     return ConversationHandler.END
 
-async def backup(update, ctx):
+async def note_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    try:
-        await update.message.reply_document(document=open(DB_PATH, 'rb'), filename="vyla_backup.db", caption="💾 Бэкап базы")
-    except Exception as e: await update.message.reply_text(f"Ошибка: {e}")
+    await update.message.reply_text("Текст заметки (или 'отмена'):")
+    return WAIT_NOTE
 
-async def history_command(update, ctx):
-    if update.effective_user.id != ADMIN_ID: return
-    if not ctx.args: return await update.message.reply_text("/history ID")
-    uid = int(ctx.args[0])
+async def receive_note(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    if update.message.text.lower() == "отмена": return ConversationHandler.END
     with closing(sqlite3.connect(DB_PATH)) as db:
-        rows = db.execute("SELECT role, text, ts FROM messages WHERE uid=? ORDER BY id DESC LIMIT 40", (uid,)).fetchall()
-    if not rows: return await update.message.reply_text("Пусто.")
-    await update.message.reply_text(f"📜 История {uid}:")
-    for r, t, ts in reversed(rows):
-        await update.message.reply_text(f"[{ts}] {r.upper()}:\n{t}")
-        await asyncio.sleep(0.05)
+        db.execute("INSERT INTO notes (text) VALUES (?)", (update.message.text,))
+        db.commit()
+    await update.message.reply_text("✅ Заметка сохранена.")
+    return ConversationHandler.END
 
-# =========================
-# BROADCAST & NEWS (ОСТАЛЬНОЕ)
-# =========================
+async def notes_cmd(update, ctx):
+    if update.effective_user.id != ADMIN_ID: return
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        rows = db.execute("SELECT id, text FROM notes ORDER BY id DESC LIMIT 10").fetchall()
+    if not rows: return await update.message.reply_text("Заметок нет.")
+    await update.message.reply_text("🗒 *Заметки:*\n" + "\n".join(f"{r[0]}. {r[1]}" for r in rows), parse_mode=ParseMode.MARKDOWN)
+
 async def set_news(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Отправь текст новости:")
+    await update.message.reply_text("Текст новости (или 'отмена'):")
     return WAIT_NEWS
 
 async def receive_news(update, ctx):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    if update.message.text.lower() == "отмена": return ConversationHandler.END
     set_setting("latest_news", update.message.text)
     await update.message.reply_text("✅ Новость обновлена.")
     return ConversationHandler.END
 
-async def last_news(update, ctx):
-    news = get_setting("latest_news")
-    if not news: return await update.message.reply_text("Новостей нет.")
-    await update.message.reply_text(f"📢 Последние новости:\n\n{news}")
-
 async def broadcast(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Отправь текст для рассылки:")
+    await update.message.reply_text("Текст для рассылки (или 'отмена'):")
     return WAIT_BROADCAST
 
 async def receive_broadcast(update, ctx):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    if update.message.text.lower() == "отмена": return ConversationHandler.END
     users = get_all_users()
-    msg = await update.message.reply_text(f"⏳ Рассылка на {len(users)} чел...")
-    success = 0
-    for uid in users:
+    msg = await update.message.reply_text(f"⏳ Рассылка на {len(users)}...")
+    ok = 0
+    for u in users:
         try:
-            await ctx.bot.send_message(uid, f"📢 Сообщение от создателя:\n\n{update.message.text}")
-            success += 1
-            await asyncio.sleep(0.05)
+            await ctx.bot.send_message(u, f"📢 *Сообщение от создателя:*\n\n{update.message.text}", parse_mode=ParseMode.MARKDOWN)
+            ok += 1; await asyncio.sleep(0.05)
         except: pass
-    await msg.edit_text(f"✅ Доставлено: {success} из {len(users)}")
+    await msg.edit_text(f"✅ Доставлено: {ok} из {len(users)}")
     return ConversationHandler.END
 
 async def admin_callback(update, ctx):
@@ -470,8 +537,8 @@ async def admin_callback(update, ctx):
         await q.message.reply_text("Причина бана (или 'отмена'):")
         return WAIT_REASON
     elif q.data.startswith("reply_"):
-        ctx.user_data["reply_target"] = int(q.data.split("_")[1])
-        await q.message.reply_text("Текст/фото для ответа (или 'отмена'):")
+        ctx.user_data["mail_target"] = int(q.data.split("_")[1])
+        await q.message.reply_text("Текст/фото (или 'отмена'):")
         return WAIT_REPLY
     elif q.data.startswith("hist_"):
         uid = int(q.data.split("_")[1])
@@ -481,10 +548,7 @@ async def admin_callback(update, ctx):
             await ctx.bot.send_message(ADMIN_ID, f"{r.upper()}: {t[:1000]}")
             await asyncio.sleep(0.05)
     elif q.data.startswith("quiz_"):
-        if q.data == "quiz_True":
-            await q.message.reply_text("✅ Правильно!")
-        else:
-            await q.message.reply_text("❌ Неправильно.")
+        await q.message.reply_text("✅ Верно!" if q.data == "quiz_True" else "❌ Неверно.")
     return ConversationHandler.END
 
 async def receive_reason(update, ctx):
@@ -499,7 +563,8 @@ async def receive_reason(update, ctx):
 async def receive_reply(update, ctx):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
     if update.message.text and update.message.text.lower() == "отмена": return ConversationHandler.END
-    uid = ctx.user_data["reply_target"]
+    uid = ctx.user_data.get("mail_target")
+    if not uid: return ConversationHandler.END
     try:
         if update.message.text: await ctx.bot.send_message(uid, update.message.text)
         elif update.message.photo: await ctx.bot.send_photo(uid, update.message.photo[-1].file_id, caption=update.message.caption or "")
@@ -522,42 +587,24 @@ def main():
         entry_points=[
             CallbackQueryHandler(admin_callback, pattern=r"^(ban_|reply_)"),
             CommandHandler("broadcast", broadcast), CommandHandler("set_news", set_news),
-            CommandHandler("trigger", trigger_cmd)
+            CommandHandler("trigger", trigger_cmd), CommandHandler("prompt", prompt_cmd),
+            CommandHandler("note", note_cmd), CommandHandler("mail", mail_cmd)
         ],
         states={
             WAIT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_reason)],
             WAIT_REPLY: [MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND & filters.User(ADMIN_ID), receive_reply)],
             WAIT_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_broadcast)],
             WAIT_NEWS: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_news)],
-            WAIT_TRIGGER_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_trigger_word)],
-            WAIT_TRIGGER_ANSWER: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_trigger_answer)],
+            WAIT_TRIGGER_W: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_trig_w)],
+            WAIT_TRIGGER_A: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_trig_a)],
+            WAIT_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_prompt)],
+            WAIT_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_note)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conv)], allow_reentry=True,
     )
 
+    # Юзерские
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("qr", qr_gen))
-    app.add_handler(CommandHandler("calc", calc))
-    app.add_handler(CommandHandler("google", google))
-    app.add_handler(CommandHandler("meme", meme))
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CommandHandler("crypto", crypto))
-    app.add_handler(CommandHandler("draw", draw))
-    app.add_handler(CommandHandler("last_news", last_news))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("users", users_list))
-    app.add_handler(CommandHandler("mute", mute_cmd))
-    app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("history", history_command))
-
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(admin_callback))
-    
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+    app.add_handler(CommandHandler("weather", weather))
+    app.add_handler(CommandHandler("remind
