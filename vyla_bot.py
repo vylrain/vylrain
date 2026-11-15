@@ -18,21 +18,12 @@ from contextlib import suppress, closing
 from datetime import datetime, timezone
 
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-    BotCommandScopeChat,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat,
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ConversationHandler,
-    ContextTypes,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ConversationHandler, ContextTypes,
 )
 from openai import AsyncOpenAI
 
@@ -40,11 +31,7 @@ from openai import AsyncOpenAI
 # CONFIGURATION
 # =========================
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
-
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("vyladigital")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
@@ -54,15 +41,18 @@ if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     log.critical("НЕТ ТОКЕНОВ! Проверь Railway.")
     exit(1)
 
+# Твой ID жестко вписан
 ADMIN_ID = 8582945012
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
 
-DB_PATH = "vyla.db"
+os.makedirs("/app/data", exist_ok=True)
+DB_PATH = "/app/data/vyla.db"
 
 MODEL = os.environ.get("VYLA_MODEL", "openai/gpt-oss-120b").strip()
 VISION_MODEL = os.environ.get("VYLA_VISION_MODEL", "llama-3.2-11b-vision-preview").strip()
 MAX_HISTORY, MAX_TG_LEN = 20, 4000
 
+# Состояния
 (WAIT_REASON, WAIT_REPLY, WAIT_BROADCAST, WAIT_NEWS, 
  WAIT_TRIGGER_W, WAIT_TRIGGER_A, WAIT_PROMPT, WAIT_NOTE) = range(8)
 
