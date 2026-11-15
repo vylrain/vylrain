@@ -4,3 +4,5 @@ httpx==0.27.2
 yt-dlp
 qrcode
 Pillow
+duckduckgo-search
+beautifulsoup4
