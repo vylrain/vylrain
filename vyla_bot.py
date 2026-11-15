@@ -607,4 +607,34 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("weather", weather))
-    app.add_handler(CommandHandler("remind
+    app.add_handler(CommandHandler("remind", remind))
+    app.add_handler(CommandHandler("qr", qr_gen))
+    app.add_handler(CommandHandler("calc", calc))
+    app.add_handler(CommandHandler("google", google))
+    app.add_handler(CommandHandler("img", google_images))
+    app.add_handler(CommandHandler("meme", meme))
+    app.add_handler(CommandHandler("quiz", quiz))
+    app.add_handler(CommandHandler("crypto", crypto))
+    app.add_handler(CommandHandler("draw", draw))
+    app.add_handler(CommandHandler("news", last_news))
+    
+    # Админские
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("users", users_list))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("mute", mute_cmd))
+    app.add_handler(CommandHandler("backup", backup))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("notes", notes_cmd))
+
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
