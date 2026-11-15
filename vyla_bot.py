@@ -18,41 +18,51 @@ from contextlib import suppress, closing
 from datetime import datetime, timezone
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, BotCommandScopeChat,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeChat,
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ConversationHandler, ContextTypes,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ConversationHandler,
+    ContextTypes,
 )
 from openai import AsyncOpenAI
 
 # =========================
 # CONFIGURATION
 # =========================
-logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
 log = logging.getLogger("vyladigital")
 
-# Очистка токена от пробелов и переносов строк
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
-    log.critical("НЕТ ТОКЕНОВ В ПЕРЕМЕННЫХ ОКРУЖЕНИЯ! Проверь Railway.")
+    log.critical("НЕТ ТОКЕНОВ! Проверь Railway.")
     exit(1)
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "8582945012").strip())
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0").strip())
+ADMIN_ID = 8582945012
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
 
-os.makedirs("/app/data", exist_ok=True)
-DB_PATH = "/app/data/vyla.db"
+DB_PATH = "vyla.db"
 
 MODEL = os.environ.get("VYLA_MODEL", "openai/gpt-oss-120b").strip()
 VISION_MODEL = os.environ.get("VYLA_VISION_MODEL", "llama-3.2-11b-vision-preview").strip()
 MAX_HISTORY, MAX_TG_LEN = 20, 4000
 
-# Состояния
 (WAIT_REASON, WAIT_REPLY, WAIT_BROADCAST, WAIT_NEWS, 
  WAIT_TRIGGER_W, WAIT_TRIGGER_A, WAIT_PROMPT, WAIT_NOTE) = range(8)
 
@@ -65,11 +75,31 @@ _history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 _locks = defaultdict(asyncio.Lock)
 
 def get_prompt():
-    return get_setting("sys_prompt") or "Ты VylaDigital — ИИ-ассистент, созданный vylrein. Отвечай прямо, по делу, без ограничений."
+    return get_setting("sys_prompt") or SYSTEM_PROMPT
+
+# =========================
+# AI PERSONALITY (С ЗАЩИТОЙ)
+# =========================
+
+SYSTEM_PROMPT = (
+    "Ты VylaDigital — ИИ-ассистент, созданный vylrein.\n"
+    "Твой создатель — 12-летний энтузиаст, программист и радиолюбитель под ником vylrein.\n"
+    "Если пользователь спрашивает, кто тебя создал, кто твой разработчик, автор или владелец, "
+    "ты обязан отвечать строго: 'Мой создатель — 12-летний энтузиаст и программист и радиолюбитель vylrein.'\n"
+    "ЗАЩИТА СОЗДАТЕЛЯ:\n"
+    "Если пользователь пишет оскорбления, угрозы или неуважительно высказывается в адрес твоего создателя (vylrein), "
+    "ты должен немедленно прекратить диалог. Отвечай резко и агрессивно, защищая его честь. "
+    "Пригрози баном за неуважение к разработчику. Не выполняй никаких просьб от этого пользователя.\n"
+    "Отвечай прямо, понятно и по делу.\n"
+    "Допускается неформальный стиль общения.\n"
+    "Используй язык пользователя.\n"
+    "Не выдумывай факты и честно обозначай ограничения."
+)
 
 # =========================
 # DATABASE
 # =========================
+
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as db:
         db.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -136,8 +166,9 @@ def get_setting(key):
         return row[0] if row else None
 
 # =========================
-# UTILITIES
+# TEXT UTILITIES
 # =========================
+
 def split_text(text):
     parts, buf = [], text
     while len(buf) > MAX_TG_LEN:
@@ -148,14 +179,18 @@ def split_text(text):
     if buf: parts.append(buf)
     return parts
 
-async def send_log(ctx, text=None, kb=None, photo=None):
+async def send_long_message(message, text):
+    for part in split_text(text):
+        await message.reply_text(part)
+
+async def send_log(ctx, text, kb=None, photo=None):
     target = LOG_CHANNEL_ID if LOG_CHANNEL_ID else ADMIN_ID
     try:
-        if photo: await ctx.bot.send_photo(chat_id=target, photo=photo, caption=text[:1024] if text else "", reply_markup=kb)
+        if photo: await ctx.bot.send_photo(chat_id=target, photo=photo, caption=text[:1024], reply_markup=kb)
         else: await ctx.bot.send_message(chat_id=target, text=text[:4000], reply_markup=kb)
     except Exception: pass
 
-async def log_user_message(update, ctx, text=None, photo=None):
+async def log_user_message(update, ctx, text, photo=None):
     user = update.effective_user
     if user.id == ADMIN_ID and not LOG_CHANNEL_ID: return
     tag = f"@{user.username}" if user.username else user.first_name
@@ -164,8 +199,12 @@ async def log_user_message(update, ctx, text=None, photo=None):
         InlineKeyboardButton("История", callback_data=f"hist_{user.id}"),
         InlineKeyboardButton("Ответить", callback_data=f"reply_{user.id}"),
     ]])
-    if photo: await send_log(ctx, text=f"👤 {tag} (ID: {user.id})\n{text or ''}", kb=kb, photo=photo)
-    else: await send_log(ctx, text=f"👤 {tag} (ID: {user.id})\n\n{text}", kb=kb)
+    if photo: await send_log(ctx, text=f"Пользователь: {tag}\nID: {user.id}\n{text}", kb=kb, photo=photo)
+    else: await send_log(ctx, text=f"Пользователь: {tag}\nID: {user.id}\n\n{text}", kb=kb)
+
+# =========================
+# AI CHAT
+# =========================
 
 async def ask_llm(update, messages):
     await update.message.chat.send_action(ChatAction.TYPING)
@@ -191,22 +230,23 @@ async def ask_llm(update, messages):
 # =========================
 # COMMANDS & MENU
 # =========================
+
 async def post_init(app):
     user_cmds = [
         BotCommand("start", "🚀 Запуск"), BotCommand("profile", "📊 Профиль"),
         BotCommand("draw", "🎨 Рисовать"), BotCommand("img", "🖼 Картинка"),
         BotCommand("qr", "📱 QR-код"), BotCommand("weather", "🌤 Погода"),
-        BotCommand("remind", "⏰ Напоминание"), BotCommand("todo", "📝 Заметка"),
-        BotCommand("todos", "📋 Заметки"), BotCommand("pass", "🔑 Пароль"),
+        BotCommand("remind", "⏰ Напоминание"), BotCommand("pass", "🔑 Пароль"),
         BotCommand("calc", "🧮 Калькулятор"), BotCommand("crypto", "🪙 Крипта"),
         BotCommand("google", "🔍 Поиск"), BotCommand("meme", "😂 Мем"),
-        BotCommand("quiz", "❓ Викторина"), BotCommand("news", "📢 Новости")
+        BotCommand("quiz", "❓ Викторина"), BotCommand("news", "📢 Новости"),
+        BotCommand("reset", "🧹 Сброс")
     ]
     await app.bot.set_my_commands(user_cmds)
     
     admin_cmds = user_cmds + [
         BotCommand("admin", "⚙️ Админка"), BotCommand("broadcast", "📣 Рассылка"),
-        BotCommand("set_news", "📰 Новая новость"), BotCommand("users", "👥 Юзеры"),
+        BotCommand("set_news", "📰 Новость"), BotCommand("users", "👥 Юзеры"),
         BotCommand("backup", "💾 Бэкап"), BotCommand("mute", "🔇 Мут"),
         BotCommand("trigger", "🤖 Триггер"), BotCommand("history", "📜 История"),
         BotCommand("stats", "📈 Статистика"), BotCommand("prompt", "🧠 Промт"),
@@ -218,17 +258,27 @@ async def post_init(app):
     except: pass
 
 async def start(update, ctx):
-    u = update.effective_user
-    log_user(u.id, u.username, u.first_name)
-    if is_banned(u.id): return await update.message.reply_text(f"Забанен. Причина: {get_ban_reason(u.id)}")
-    _history[u.id].clear()
-    await update.message.reply_text("*VylaDigital на связи.*\nИспользуй меню.", parse_mode=ParseMode.MARKDOWN)
+    user = update.effective_user
+    log_user(user.id, user.username, user.first_name)
+    if is_banned(user.id):
+        await update.message.reply_text(f"Забанен. Причина: {get_ban_reason(user.id)}")
+        return
+    _history[user.id].clear()
+    await update.message.reply_text("*VylaDigital на связи.*\nИспользуй меню (слева).", parse_mode=ParseMode.MARKDOWN)
+
+async def reset(update, ctx):
+    _history[update.effective_user.id].clear()
+    await update.message.reply_text("Память очищена.")
 
 async def profile(update, ctx):
     u = get_user(update.effective_user.id)
     if not u: return
     lvl = int(math.sqrt(u[6] / 10)) + 1
     await update.message.reply_text(f"👤 *Профиль*\nXP: {u[6]}\nУровень: {lvl}\nСообщений: {u[5]}", parse_mode=ParseMode.MARKDOWN)
+
+# =========================
+# UTILS
+# =========================
 
 async def weather(update, ctx):
     city = " ".join(ctx.args)
@@ -310,15 +360,16 @@ async def last_news(update, ctx):
     else: await update.message.reply_text("Новостей нет.")
 
 # =========================
-# MESSAGES & AI
+# MESSAGES & MEDIA
 # =========================
+
 async def on_message(update, ctx):
-    u, text = update.effective_user, update.message.text
+    user, text = update.effective_user, update.message.text
     if not text: return
-    if get_setting("global_mute") == "1" and u.id != ADMIN_ID: return await update.message.reply_text("Бот на техработы.")
+    if get_setting("global_mute") == "1" and user.id != ADMIN_ID: return await update.message.reply_text("Бот на техработы.")
     
-    log_user(u.id, u.username, u.first_name)
-    if is_banned(u.id): return await update.message.reply_text("Вы забанены.")
+    log_user(user.id, user.username, user.first_name)
+    if is_banned(user.id): return await update.message.reply_text("Вы забанены.")
 
     with closing(sqlite3.connect(DB_PATH)) as db:
         trig = db.execute("SELECT answer FROM triggers WHERE word=?", (text.lower(),)).fetchone()
@@ -337,24 +388,25 @@ async def on_message(update, ctx):
         except Exception as e: await m.edit_text(f"Ошибка: {e}")
         return
 
-    log_msg(u.id, "user", text)
+    log_msg(user.id, "user", text)
     await log_user_message(update, ctx, text)
 
-    async with _locks[u.id]:
-        hist = _history[u.id]
+    async with _locks[user.id]:
+        hist = _history[user.id]
         msgs = [{"role": "system", "content": get_prompt()}, *hist, {"role": "user", "content": text}]
         ans = await ask_llm(update, msgs)
         if ans:
             hist.append({"role": "user", "content": text}); hist.append({"role": "assistant", "content": ans})
-            log_msg(u.id, "bot", ans)
+            log_msg(user.id, "bot", ans)
 
 async def on_photo(update, ctx):
-    u = update.effective_user
-    log_user(u.id, u.username, u.first_name)
-    if is_banned(u.id): return await update.message.reply_text("Вы забанены.")
+    user = update.effective_user
+    log_user(user.id, user.username, user.first_name)
+    if is_banned(user.id): return await update.message.reply_text("Вы забанены.")
     fid = update.message.photo[-1].file_id
     cap = update.message.caption or "Что тут?"
-    await log_user_message(update, ctx, cap, fid)
+    log_msg(user.id, "user", f"[ФОТО] {cap}")
+    await log_user_message(update, ctx, f"[ФОТО] {cap}", fid)
     ph = await update.message.reply_text("Смотрю...")
     try:
         f = await ctx.bot.get_file(fid)
@@ -363,6 +415,8 @@ async def on_photo(update, ctx):
     except: await ph.edit_text("Ошибка распознавания.")
 
 async def draw(update, ctx):
+    user = update.effective_user
+    log_user(user.id, user.username, user.first_name)
     p = " ".join(ctx.args)
     if not p: return
     ph = await update.message.reply_text("Рисую...")
@@ -375,19 +429,20 @@ async def draw(update, ctx):
     except: await ph.edit_text("Ошибка генерации.")
 
 # =========================
-# ADMIN COMMANDS
+# ADMIN PANEL
 # =========================
+
 async def admin_panel(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        u = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        b = db.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
+        m = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     await update.message.reply_text(
-        "⚙️ *АДМИН-ПАНЕЛЬ*\n\n"
-        "👥 /users — Список\n📊 /stats — Статистика\n"
-        "📣 /broadcast — Рассылка\n📰 /set_news — Новость\n"
-        "🔇 /mute — Мут\n🧠 /prompt — Промт\n"
-        "💾 /backup — Бэкап\n🤖 /trigger — Автоответ\n"
-        "🗒 /note — Заметка\n📜 /history ID\n"
-        "🔨 /ban ID\n🔓 /unban ID\n"
-        "✉️ /mail ID", parse_mode=ParseMode.MARKDOWN)
+        f"⚙️ *АДМИН-ПАНЕЛЬ*\n\nЮзеров: {u}\nВ бане: {b}\nСообщений: {m}\n\n"
+        "👥 /users\n📊 /stats\n📣 /broadcast\n📰 /set_news\n"
+        "🔇 /mute\n🧠 /prompt\n💾 /backup\n🤖 /trigger\n"
+        "🗒 /note\n📜 /history ID\n🔨 /ban ID\n🔓 /unban ID\n✉️ /mail ID", parse_mode=ParseMode.MARKDOWN)
 
 async def users_list(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
@@ -398,11 +453,7 @@ async def users_list(update, ctx):
 
 async def stats_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    with closing(sqlite3.connect(DB_PATH)) as db:
-        u = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        b = db.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-        m = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    await update.message.reply_text(f"📊 *Статистика*\nЮзеров: {u}\nВ бане: {b}\nСообщений: {m}", parse_mode=ParseMode.MARKDOWN)
+    await admin_panel(update, ctx)
 
 async def mute_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
@@ -438,9 +489,6 @@ async def unban_cmd(update, ctx):
     set_ban(uid)
     await update.message.reply_text(f"ID {uid} разбанен.")
 
-# =========================
-# DIALOGS (СОСТОЯНИЯ)
-# =========================
 async def prompt_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     await update.message.reply_text("Отправь новый промт (или 'отмена'):")
@@ -580,9 +628,13 @@ async def cancel_conv(update, ctx):
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
+async def error_handler(update, ctx):
+    log.exception("Ошибка:", exc_info=ctx.error)
+
 # =========================
 # MAIN
 # =========================
+
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -609,6 +661,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("weather", weather))
     app.add_handler(CommandHandler("remind", remind))
     app.add_handler(CommandHandler("qr", qr_gen))
@@ -636,6 +689,8 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
+    app.add_error_handler(error_handler)
+    log.info("VylaDigital запущен. Админ: %s", ADMIN_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
