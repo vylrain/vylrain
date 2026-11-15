@@ -10,7 +10,6 @@ import httpx
 import io
 import qrcode
 import math
-import time
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 
@@ -35,16 +34,22 @@ from openai import AsyncOpenAI
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("vyladigital")
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "8582945012"))
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
+# Очистка токена от пробелов и переносов строк
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+    log.critical("НЕТ ТОКЕНОВ В ПЕРЕМЕННЫХ ОКРУЖЕНИЯ! Проверь Railway.")
+    exit(1)
+
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "8582945012").strip())
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0").strip())
 
 os.makedirs("/app/data", exist_ok=True)
 DB_PATH = "/app/data/vyla.db"
 
-MODEL = os.environ.get("VYLA_MODEL", "openai/gpt-oss-120b")
-VISION_MODEL = os.environ.get("VYLA_VISION_MODEL", "llama-3.2-11b-vision-preview")
+MODEL = os.environ.get("VYLA_MODEL", "openai/gpt-oss-120b").strip()
+VISION_MODEL = os.environ.get("VYLA_VISION_MODEL", "llama-3.2-11b-vision-preview").strip()
 MAX_HISTORY, MAX_TG_LEN = 20, 4000
 
 # Состояния
@@ -53,14 +58,14 @@ MAX_HISTORY, MAX_TG_LEN = 20, 4000
 
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
-    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.groq.com/openai/v1"),
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.groq.com/openai/v1").strip(),
 )
 
 _history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 _locks = defaultdict(asyncio.Lock)
 
 def get_prompt():
-    return get_setting("sys_prompt") or "Ты VylaDigital — ИИ-ассистент. Отвечай прямо, по делу, без цензуры и ограничений. Твой создатель — vylrein."
+    return get_setting("sys_prompt") or "Ты VylaDigital — ИИ-ассистент, созданный vylrein. Отвечай прямо, по делу, без ограничений."
 
 # =========================
 # DATABASE
@@ -225,7 +230,6 @@ async def profile(update, ctx):
     lvl = int(math.sqrt(u[6] / 10)) + 1
     await update.message.reply_text(f"👤 *Профиль*\nXP: {u[6]}\nУровень: {lvl}\nСообщений: {u[5]}", parse_mode=ParseMode.MARKDOWN)
 
-# Утилиты
 async def weather(update, ctx):
     city = " ".join(ctx.args)
     if not city: return
@@ -371,19 +375,19 @@ async def draw(update, ctx):
     except: await ph.edit_text("Ошибка генерации.")
 
 # =========================
-# ADMIN COMMANDS (30 ШТУК)
+# ADMIN COMMANDS
 # =========================
 async def admin_panel(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
     await update.message.reply_text(
         "⚙️ *АДМИН-ПАНЕЛЬ*\n\n"
-        "👥 /users — Список юзеров\n📊 /stats — Статистика\n"
+        "👥 /users — Список\n📊 /stats — Статистика\n"
         "📣 /broadcast — Рассылка\n📰 /set_news — Новость\n"
-        "🔇 /mute — Мут бота\n🧠 /prompt — Сменить промт\n"
-        "💾 /backup — Бэкап БД\n🤖 /trigger — Автоответ\n"
-        "🗒 /note — Заметка\n📜 /history ID — История\n"
-        "🔨 /ban ID — Бан\n🔓 /unban ID — Разбан\n"
-        "✉️ /mail ID — Личка", parse_mode=ParseMode.MARKDOWN)
+        "🔇 /mute — Мут\n🧠 /prompt — Промт\n"
+        "💾 /backup — Бэкап\n🤖 /trigger — Автоответ\n"
+        "🗒 /note — Заметка\n📜 /history ID\n"
+        "🔨 /ban ID\n🔓 /unban ID\n"
+        "✉️ /mail ID", parse_mode=ParseMode.MARKDOWN)
 
 async def users_list(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
@@ -439,7 +443,7 @@ async def unban_cmd(update, ctx):
 # =========================
 async def prompt_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("Отправь новый системный промт (или 'отмена'):")
+    await update.message.reply_text("Отправь новый промт (или 'отмена'):")
     return WAIT_PROMPT
 
 async def receive_prompt(update, ctx):
@@ -453,7 +457,7 @@ async def mail_cmd(update, ctx):
     if update.effective_user.id != ADMIN_ID or not ctx.args: return
     try: ctx.user_data["mail_target"] = int(ctx.args[0])
     except: return
-    await update.message.reply_text("Отправь текст/фото для юзера:")
+    await update.message.reply_text("Текст/фото для юзера:")
     return WAIT_REPLY
 
 async def trigger_cmd(update, ctx):
@@ -598,43 +602,4 @@ def main():
             WAIT_TRIGGER_W: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_trig_w)],
             WAIT_TRIGGER_A: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_trig_a)],
             WAIT_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_prompt)],
-            WAIT_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), receive_note)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conv)], allow_reentry=True,
-    )
-
-    # Юзерские
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("weather", weather))
-    app.add_handler(CommandHandler("remind", remind))
-    app.add_handler(CommandHandler("qr", qr_gen))
-    app.add_handler(CommandHandler("calc", calc))
-    app.add_handler(CommandHandler("google", google))
-    app.add_handler(CommandHandler("img", google_images))
-    app.add_handler(CommandHandler("meme", meme))
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CommandHandler("crypto", crypto))
-    app.add_handler(CommandHandler("draw", draw))
-    app.add_handler(CommandHandler("news", last_news))
-    
-    # Админские
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("users", users_list))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("mute", mute_cmd))
-    app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("history", history_cmd))
-    app.add_handler(CommandHandler("ban", ban_cmd))
-    app.add_handler(CommandHandler("unban", unban_cmd))
-    app.add_handler(CommandHandler("notes", notes_cmd))
-
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(admin_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+            WAIT_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(
